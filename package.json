@@ -1,0 +1,16 @@
+{
+  "name": "hubspot-monday-sync",
+  "version": "1.0.0",
+  "description": "Two-way sync between HubSpot tickets and Monday.com boards",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "body-parser": "^1.20.2",
+    "node-cron": "^3.0.3"
+  }
+}
