@@ -755,11 +755,11 @@ app.get('/', (req, res) => {
           <h3>Sync Log</h3>
           <div class="log">
             ${config.syncLog.length === 0 ? '<div>No sync activity yet...</div>' : ''}
-            ${config.syncLog.map(entry => `
-              <div class="log-entry ${entry.type}">
+            ${config.syncLog.map(entry => 
+              `<div class="log-entry ${entry.type}">
                 [${new Date(entry.timestamp).toLocaleTimeString()}] ${entry.message}
-              </div>
-            `).join('')}
+              </div>`
+            ).join('')}
           </div>
         </div>
 
