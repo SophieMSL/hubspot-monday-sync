@@ -23,7 +23,18 @@ let config = {
     status: 'monday',        // Monday owns status updates
     priority: 'monday',      // Monday owns priority
     assignee: 'both'         // Both can update assignee
-  }
+  },
+  // Field mapping: which HubSpot field maps to which Monday column
+  fieldMapping: {
+    description: 'text',     // HubSpot 'content' → Monday column ID
+    status: 'status',        // HubSpot 'hs_pipeline_stage' → Monday column ID
+    priority: 'priority',    // HubSpot 'hs_ticket_priority' → Monday column ID
+    assignee: 'person'       // HubSpot 'hubspot_owner_id' → Monday column ID
+  },
+  // Cached Monday columns (fetched from API)
+  mondayColumns: [],
+  // Cached HubSpot properties
+  hubspotProperties: []
 };
 
 // Sync state tracking to prevent infinite loops
@@ -39,6 +50,64 @@ function logSync(message, type = 'info') {
   config.syncLog.unshift(logEntry);
   if (config.syncLog.length > 50) config.syncLog.pop();
   console.log(`[${type.toUpperCase()}] ${message}`);
+}
+
+// ========== FIELD DISCOVERY FUNCTIONS ==========
+
+async function fetchHubSpotProperties() {
+  try {
+    const response = await axios.get('https://api.hubapi.com/crm/v3/properties/tickets', {
+      headers: {
+        'Authorization': `Bearer ${config.hubspotToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    config.hubspotProperties = response.data.results.map(prop => ({
+      name: prop.name,
+      label: prop.label,
+      type: prop.type,
+      description: prop.description || ''
+    }));
+    
+    return config.hubspotProperties;
+  } catch (error) {
+    logSync(`Error fetching HubSpot properties: ${error.message}`, 'error');
+    return [];
+  }
+}
+
+async function fetchMondayColumns() {
+  try {
+    const query = `
+      query ($boardId: ID!) {
+        boards(ids: [$boardId]) {
+          columns {
+            id
+            title
+            type
+            settings_str
+          }
+        }
+      }
+    `;
+    
+    const data = await mondayQuery(query, { boardId: config.mondayBoardId });
+    
+    if (data.boards && data.boards[0]) {
+      config.mondayColumns = data.boards[0].columns.map(col => ({
+        id: col.id,
+        title: col.title,
+        type: col.type,
+        settings: col.settings_str
+      }));
+    }
+    
+    return config.mondayColumns;
+  } catch (error) {
+    logSync(`Error fetching Monday columns: ${error.message}`, 'error');
+    return [];
+  }
 }
 
 // ========== HUBSPOT FUNCTIONS ==========
@@ -165,16 +234,22 @@ async function createMondayItem(ticketData) {
     }
   `;
   
-  const columnValues = JSON.stringify({
-    text: ticketData.content || '',
-    status: ticketData.status || 'New',
-    priority: ticketData.priority || 'Medium'
-  });
+  // Build column values using configured field mapping
+  const columnValues = {};
+  if (ticketData.content && config.fieldMapping.description) {
+    columnValues[config.fieldMapping.description] = ticketData.content;
+  }
+  if (ticketData.status && config.fieldMapping.status) {
+    columnValues[config.fieldMapping.status] = ticketData.status;
+  }
+  if (ticketData.priority && config.fieldMapping.priority) {
+    columnValues[config.fieldMapping.priority] = ticketData.priority;
+  }
   
   const data = await mondayQuery(query, {
     boardId: config.mondayBoardId,
     itemName: ticketData.subject,
-    columnValues
+    columnValues: JSON.stringify(columnValues)
   });
   
   return data.create_item;
@@ -189,11 +264,17 @@ async function updateMondayItem(itemId, ticketData) {
     }
   `;
   
-  // Only include fields that are provided
+  // Only include fields that are provided, using configured field mapping
   const columnValues = {};
-  if (ticketData.content !== undefined) columnValues.text = ticketData.content;
-  if (ticketData.status !== undefined) columnValues.status = ticketData.status;
-  if (ticketData.priority !== undefined) columnValues.priority = ticketData.priority;
+  if (ticketData.content !== undefined && config.fieldMapping.description) {
+    columnValues[config.fieldMapping.description] = ticketData.content;
+  }
+  if (ticketData.status !== undefined && config.fieldMapping.status) {
+    columnValues[config.fieldMapping.status] = ticketData.status;
+  }
+  if (ticketData.priority !== undefined && config.fieldMapping.priority) {
+    columnValues[config.fieldMapping.priority] = ticketData.priority;
+  }
   
   const data = await mondayQuery(query, {
     boardId: config.mondayBoardId,
@@ -290,9 +371,10 @@ async function syncMondayToHubSpot() {
     let updated = 0;
     
     for (const item of mondayItems) {
-      const textCol = item.column_values.find(col => col.id === 'text');
-      const statusCol = item.column_values.find(col => col.id === 'status');
-      const priorityCol = item.column_values.find(col => col.id === 'priority');
+      // Use configured field mapping to find columns
+      const textCol = item.column_values.find(col => col.id === config.fieldMapping.description);
+      const statusCol = item.column_values.find(col => col.id === config.fieldMapping.status);
+      const priorityCol = item.column_values.find(col => col.id === config.fieldMapping.priority);
       
       const itemData = {
         subject: item.name,
@@ -499,6 +581,96 @@ app.get('/', (req, res) => {
         </form>
 
         <div class="section">
+          <h3>🗺️ Field Mapping</h3>
+          <p class="help-text">Map HubSpot ticket fields to Monday.com board columns</p>
+          
+          <button onclick="discoverFields()" class="success" style="margin-bottom: 20px;">
+            🔍 Discover Available Fields
+          </button>
+          <span id="discover-status" style="margin-left: 10px; color: #666;"></span>
+
+          <div id="field-mapping-container">
+            <form action="/field-mapping" method="POST">
+              <div class="form-group">
+                <label>Description Field</label>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                  <div style="flex: 1;">
+                    <div class="help-text">HubSpot: content (ticket description)</div>
+                  </div>
+                  <div style="flex: 0 0 50px; text-align: center;">→</div>
+                  <div style="flex: 1;">
+                    <select name="description_monday" id="description_monday" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
+                      <option value="text" ${config.fieldMapping.description === 'text' ? 'selected' : ''}>text (default)</option>
+                    </select>
+                    <div class="help-text">Monday column for description</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label>Status Field</label>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                  <div style="flex: 1;">
+                    <div class="help-text">HubSpot: hs_pipeline_stage</div>
+                  </div>
+                  <div style="flex: 0 0 50px; text-align: center;">→</div>
+                  <div style="flex: 1;">
+                    <select name="status_monday" id="status_monday" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
+                      <option value="status" ${config.fieldMapping.status === 'status' ? 'selected' : ''}>status (default)</option>
+                    </select>
+                    <div class="help-text">Monday column for status</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label>Priority Field</label>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                  <div style="flex: 1;">
+                    <div class="help-text">HubSpot: hs_ticket_priority</div>
+                  </div>
+                  <div style="flex: 0 0 50px; text-align: center;">→</div>
+                  <div style="flex: 1;">
+                    <select name="priority_monday" id="priority_monday" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
+                      <option value="priority" ${config.fieldMapping.priority === 'priority' ? 'selected' : ''}>priority (default)</option>
+                    </select>
+                    <div class="help-text">Monday column for priority</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label>Assignee Field</label>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                  <div style="flex: 1;">
+                    <div class="help-text">HubSpot: hubspot_owner_id</div>
+                  </div>
+                  <div style="flex: 0 0 50px; text-align: center;">→</div>
+                  <div style="flex: 1;">
+                    <select name="assignee_monday" id="assignee_monday" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
+                      <option value="person" ${config.fieldMapping.assignee === 'person' ? 'selected' : ''}>person (default)</option>
+                    </select>
+                    <div class="help-text">Monday column for assignee</div>
+                  </div>
+                </div>
+              </div>
+
+              <button type="submit">💾 Save Field Mapping</button>
+            </form>
+          </div>
+
+          <div style="background: #e6f3ff; border-left: 4px solid #0073ea; padding: 15px; margin-top: 20px; border-radius: 4px;">
+            <strong>💡 How Field Mapping Works:</strong>
+            <ul style="margin: 10px 0; padding-left: 20px;">
+              <li>Click "Discover Available Fields" to see all columns in your Monday board</li>
+              <li>Select which Monday column should receive each HubSpot field</li>
+              <li>The Title/Name field is automatically mapped (HubSpot subject → Monday item name)</li>
+              <li>Make sure your Monday column types match (e.g., Status column for status field)</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="section">
           <h3>⚙️ Field Sync Rules</h3>
           <p class="help-text">Choose which platform is the "source of truth" for each field. This prevents conflicts!</p>
           
@@ -605,6 +777,92 @@ app.get('/', (req, res) => {
       <script>
         // Auto-refresh every 30 seconds to show latest logs
         setTimeout(() => location.reload(), 30000);
+
+        // Field discovery function
+        async function discoverFields() {
+          const statusEl = document.getElementById('discover-status');
+          statusEl.textContent = '🔄 Discovering fields...';
+          statusEl.style.color = '#0073ea';
+
+          try {
+            const response = await fetch('/discover-fields');
+            const data = await response.json();
+
+            if (data.success) {
+              statusEl.textContent = '✅ Fields discovered!';
+              statusEl.style.color = '#00c875';
+
+              // Populate Monday column dropdowns
+              populateColumnDropdown('description_monday', data.monday, data.currentMapping.description, ['long-text', 'text']);
+              populateColumnDropdown('status_monday', data.monday, data.currentMapping.status, ['status', 'color']);
+              populateColumnDropdown('priority_monday', data.monday, data.currentMapping.priority, ['dropdown', 'status']);
+              populateColumnDropdown('assignee_monday', data.monday, data.currentMapping.assignee, ['people', 'person']);
+
+              // Show available HubSpot fields in console for reference
+              console.log('Available HubSpot Fields:', data.hubspot);
+              console.log('Available Monday Columns:', data.monday);
+
+              setTimeout(() => {
+                statusEl.textContent = '';
+              }, 3000);
+            } else {
+              statusEl.textContent = '❌ Error: ' + data.error;
+              statusEl.style.color = '#e44258';
+            }
+          } catch (error) {
+            statusEl.textContent = '❌ Error discovering fields';
+            statusEl.style.color = '#e44258';
+            console.error(error);
+          }
+        }
+
+        function populateColumnDropdown(selectId, columns, currentValue, preferredTypes) {
+          const select = document.getElementById(selectId);
+          if (!select) return;
+
+          // Clear existing options except the default
+          select.innerHTML = '';
+
+          // Add all Monday columns
+          columns.forEach(col => {
+            const option = document.createElement('option');
+            option.value = col.id;
+            
+            // Show column title, type, and ID
+            option.textContent = `${col.title} (${col.type}) [${col.id}]`;
+            
+            // Highlight if it matches preferred type
+            if (preferredTypes.includes(col.type.toLowerCase())) {
+              option.textContent += ' ⭐';
+            }
+            
+            // Select if it matches current mapping
+            if (col.id === currentValue) {
+              option.selected = true;
+            }
+            
+            select.appendChild(option);
+          });
+
+          // If no match found, add current value as option
+          if (currentValue && !columns.find(c => c.id === currentValue)) {
+            const option = document.createElement('option');
+            option.value = currentValue;
+            option.textContent = `${currentValue} (current - not found in board)`;
+            option.selected = true;
+            select.insertBefore(option, select.firstChild);
+          }
+        }
+
+        // Auto-discover fields on page load if config is set
+        window.addEventListener('load', () => {
+          // Only auto-discover if we have API credentials
+          if ('${config.hubspotToken}' && '${config.mondayToken}' && '${config.mondayBoardId}') {
+            setTimeout(() => {
+              discoverFields();
+            }, 1000);
+          }
+        });
       </script>
     </body>
     </html>
@@ -627,6 +885,47 @@ app.post('/rules', (req, res) => {
   config.fieldRules.assignee = req.body.assignee || 'both';
   logSync(`Field rules updated: Title=${config.fieldRules.title}, Description=${config.fieldRules.description}, Status=${config.fieldRules.status}, Priority=${config.fieldRules.priority}, Assignee=${config.fieldRules.assignee}`, 'success');
   res.redirect('/');
+});
+
+app.get('/discover-fields', async (req, res) => {
+  try {
+    logSync('Discovering available fields from HubSpot and Monday...', 'info');
+    
+    const [hubspotProps, mondayColumns] = await Promise.all([
+      fetchHubSpotProperties(),
+      fetchMondayColumns()
+    ]);
+    
+    res.json({
+      success: true,
+      hubspot: hubspotProps,
+      monday: mondayColumns,
+      currentMapping: config.fieldMapping
+    });
+  } catch (error) {
+    res.json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/field-mapping', (req, res) => {
+  try {
+    // Update field mapping from form
+    config.fieldMapping = {
+      description: req.body.description_monday || 'text',
+      status: req.body.status_monday || 'status',
+      priority: req.body.priority_monday || 'priority',
+      assignee: req.body.assignee_monday || 'person'
+    };
+    
+    logSync(`Field mapping updated: ${JSON.stringify(config.fieldMapping)}`, 'success');
+    res.redirect('/');
+  } catch (error) {
+    logSync(`Error updating field mapping: ${error.message}`, 'error');
+    res.redirect('/');
+  }
 });
 
 app.post('/enable', (req, res) => {
